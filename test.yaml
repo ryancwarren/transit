@@ -1,0 +1,83 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "dremio.fullname" . }}-test
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "dremio.labels" . | nindent 4 }}
+  annotations:
+    # Run this job after install or upgrade
+    "helm.sh/hook": test
+    "helm.sh/hook-weight": "-5"
+    "helm.sh/hook-delete-policy": hook-succeeded, hook-failed
+spec:
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+      - name: dremio-test
+        image: "curlimages/curl:latest"  # Lightweight image with curl
+        command:
+        - sh
+        - -c
+        - |
+          # Check if Dremio coordinator pods are running
+          POD_COUNT=$(kubectl get pods -n {{ .Release.Namespace }} -l app.kubernetes.io/name={{ include "dremio.name" . }},app.kubernetes.io/component=coordinator -o jsonpath='{.items | length}')
+          if [ "$POD_COUNT" -eq 0 ]; then
+            echo "Error: No Dremio coordinator pods found."
+            exit 1
+          fi
+          echo "Found $POD_COUNT Dremio coordinator pod(s)."
+
+          # Wait for pods to be ready (timeout 300s)
+          kubectl wait --for=condition=Ready pod -n {{ .Release.Namespace }} -l app.kubernetes.io/name={{ include "dremio.name" . }},app.kubernetes.io/component=coordinator --timeout=300s || {
+            echo "Error: Dremio coordinator pods not ready within 300 seconds."
+            exit 1
+          }
+          echo "Dremio coordinator pods are ready."
+
+          # Check Dremio service availability (e.g., HTTP port 9047)
+          SERVICE_NAME={{ include "dremio.fullname" . }}-coordinator
+          SERVICE_PORT={{ .Values.service.coordinator.port | default 9047 }}
+          curl -s -f "http://$SERVICE_NAME:{{ .Values.service.coordinator.port | default 9047 }}/api/v3/server_status" > /dev/null || {
+            echo "Error: Dremio coordinator service not accessible at http://$SERVICE_NAME:$SERVICE_PORT."
+            exit 1
+          }
+          echo "Dremio coordinator service is accessible."
+
+          {{- if .Values.dremio.services.coordinator.enabled }}
+          # Optional: Check Dremio configuration (e.g., via API or config file)
+          # Example: Verify coordinator is enabled by checking server status
+          STATUS=$(curl -s "http://$SERVICE_NAME:{{ .Values.service.coordinator.port | default 9047 }}/api/v3/server_status" | jq -r '.status')
+          if [ "$STATUS" != "RUNNING" ]; then
+            echo "Error: Dremio server status is $STATUS, expected RUNNING."
+            exit 1
+          fi
+          echo "Dremio server status is RUNNING."
+          {{- end }}
+
+          echo "Dremio deployment test passed!"
+        env:
+        - name: KUBECTL_VERSION
+          value: "v1.28.0"  # Adjust as needed
+        resources:
+          limits:
+            cpu: "100m"
+            memory: "128Mi"
+          requests:
+            cpu: "50m"
+            memory: "64Mi"
+      initContainers:
+      - name: install-kubectl
+        image: "bitnami/kubectl:1.28.0"
+        command:
+        - sh
+        - -c
+        - |
+          cp /opt/bitnami/kubectl/bin/kubectl /kubectl-bin/kubectl
+        volumeMounts:
+        - name: kubectl-bin
+          mountPath: /kubectl-bin
+      volumes:
+      - name: kubectl-bin
+        emptyDir: {}
