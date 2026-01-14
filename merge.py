@@ -1,159 +1,177 @@
 #!/usr/bin/env python3
-import yaml
+"""
+Script to add/update TCP port mappings in kustomization.yaml using ruamel.yaml
+for clean literal block style output.
+"""
+
 import sys
 import argparse
 from pathlib import Path
 
-def find_next_index(current_ports):
-    """
-    Determine the next available index based on existing ports.
-    Ports are in 331xx and 349xx ranges → index = xx part.
-    """
-    used_indexes = set()
-    for port in current_ports:
-        if port.startswith('331') or port.startswith('349'):
+from ruamel.yaml import YAML
+from ruamel.yaml.scalarstring import LiteralScalarString
+
+yaml = YAML()
+yaml.indent(mapping=2, sequence=4, offset=2)
+yaml.width = 4096
+yaml.preserve_quotes = True
+
+
+def parse_existing_tcp_patch(patch_content: str) -> dict:
+    """Extract current port:target mappings from existing patch text"""
+    current = {}
+    lines = patch_content.splitlines()
+    in_value = False
+
+    for line in lines:
+        stripped = line.rstrip()
+        if stripped.strip() == 'value: |':
+            in_value = True
+            continue
+        if in_value and ':' in stripped and stripped.lstrip().startswith(('0','1','2','3','4','5','6','7','8','9')):
             try:
-                index = int(port[3:])  # e.g., '33105' → 5, '34912' → 12
-                used_indexes.add(index)
-            except ValueError:
-                continue
-    if not used_indexes:
-        return 1
-    return max(used_indexes) + 1
+                indent, rest = line.split(':', 1)
+                port = rest.split(':', 1)[0].strip() if ':' in rest else ""
+                target = rest.split(':', 1)[1].strip() if ':' in rest else rest.strip()
+                if port.isdigit():
+                    current[port] = target
+            except:
+                pass
+    return current
 
-def update_tcp_ports_in_patch(data, namespace):
-    """
-    Automatically find the next index and add ports for the given namespace.
-    Adds:
-      3310N: {namespace}/dremio-client:31010
-      3490N: {namespace}/dremio-client:32010
-    where N is the next available index.
-    """
-    # Collect existing ports
-    current_ports = set()
-    patch_found = False
 
-    if 'patches' in data:
-        for patch_item in data['patches']:
-            if isinstance(patch_item, dict) and 'patch' in patch_item:
-                patch_content = patch_item['patch'].strip()
-                if patch_content.startswith('- op: add') and 'path: /spec/values/tcp' in patch_content:
-                    patch_found = True
-                    lines = [line.rstrip() for line in patch_content.splitlines()]
-                    value_start = False
-                    for line in lines:
-                        if line.strip().startswith('value:'):
-                            value_start = True
-                            continue
-                        if value_start and ':' in line and not line.startswith('-'):
-                            key = line.split(':', 1)[0].strip()
-                            if key.isdigit():
-                                current_ports.add(key)
+def build_tcp_patch_text(mappings: dict) -> str:
+    """Create clean patch text with literal block"""
+    lines = [
+        "- op: add",
+        "  path: /spec/values/tcp",
+        "  value: |"
+    ]
 
-    next_index = find_next_index(current_ports)
-    print(f"Determined next available index: {next_index}")
+    for port in sorted(mappings.keys(), key=int):
+        lines.append(f"    {port}: {mappings[port]}")
 
-    host_port_1 = 33100 + next_index
-    host_port_2 = 34900 + next_index
-    target_1 = f"{namespace}/dremio-client:31010"
-    target_2 = f"{namespace}/dremio-client:32010"
+    if not mappings:
+        lines.append("    {}")
 
-    new_entries = {
-        str(host_port_1): target_1,
-        str(host_port_2): target_2,
+    return "\n".join(lines)
+
+
+def update_tcp_patch(
+    data: dict,
+    host_port: int,
+    namespace: str,
+    service: str,
+    container_port: int,
+    second_pair: tuple | None = None
+) -> dict:
+    target = f"{namespace}/{service}:{container_port}"
+
+    # Find existing tcp patch
+    patch_index = -1
+    existing_patch = None
+
+    patches = data.get('patches', [])
+    for i, item in enumerate(patches):
+        if isinstance(item, dict) and 'patch' in item:
+            content = str(item['patch']).strip()
+            if 'path: /spec/values/tcp' in content and '- op: add' in content:
+                patch_index = i
+                existing_patch = item
+                break
+
+    # Get current mappings
+    current_mappings = {}
+    if existing_patch:
+        current_mappings = parse_existing_tcp_patch(str(existing_patch['patch']))
+
+    # Add new mapping(s)
+    new_mappings = {str(host_port): target}
+
+    if second_pair:
+        h2, c2 = second_pair
+        t2 = f"{namespace}/{service}:{c2}"
+        new_mappings[str(h2)] = t2
+
+    # Merge (new values override if conflict)
+    current_mappings.update(new_mappings)
+
+    # Build new patch content
+    patch_text = build_tcp_patch_text(current_mappings)
+
+    new_patch_entry = {
+        'patch': LiteralScalarString(patch_text)
     }
 
-    if patch_found:
-        # Update existing patch
-        for patch_item in data['patches']:
-            if isinstance(patch_item, dict) and 'patch' in patch_item:
-                patch_content = patch_item['patch'].strip()
-                if patch_content.startswith('- op: add') and 'path: /spec/values/tcp' in patch_content:
-                    current_value = {}
-                    lines = [line.rstrip() for line in patch_content.splitlines()]
-                    value_start = False
-                    for line in lines:
-                        if line.strip().startswith('value:'):
-                            value_start = True
-                            continue
-                        if value_start and ':' in line and not line.startswith('-'):
-                            key_part = line.split(':', 1)
-                            if len(key_part) == 2:
-                                key = key_part[0].strip()
-                                val = key_part[1].strip()
-                                if key.isdigit():
-                                    current_value[key] = val
-
-                    current_value.update(new_entries)
-
-                    # Rebuild sorted value block
-                    new_value_lines = ['  value:']
-                    for port in sorted(current_value.keys(), key=int):
-                        new_value_lines.append(f"    {port}: {current_value[port]}")
-
-                    new_patch_lines = [
-                        '- op: add',
-                        '  path: /spec/values/tcp',
-                    ] + new_value_lines
-
-                    patch_item['patch'] = '\n'.join(new_patch_lines) + '\n'
-                    print(f"Updated existing tcp patch with ports {host_port_1} and {host_port_2} for namespace '{namespace}'")
-                    break
+    if patch_index >= 0:
+        # Update existing
+        data['patches'][patch_index] = new_patch_entry
+        print(f"Updated existing TCP patch → added/updated {host_port}")
+        if second_pair:
+            print(f"                           + {second_pair[0]}")
     else:
-        # Create new patch
-        new_patch = {
-            'patch': f"""- op: add
-  path: /spec/values/tcp
-  value:
-    {host_port_1}: {target_1}
-    {host_port_2}: {target_2}
-"""
-        }
+        # Add new patch
         if 'patches' not in data:
             data['patches'] = []
-        data['patches'].append(new_patch)
-        print(f"Created new tcp patch for namespace '{namespace}' with ports {host_port_1} and {host_port_2}")
+        data['patches'].append(new_patch_entry)
+        print(f"Created new TCP patch → added {host_port}")
+        if second_pair:
+            print(f"                    + {second_pair[0]}")
 
     return data
 
+
 def main():
     parser = argparse.ArgumentParser(
-        description="Automatically update kustomization.yaml with next available TCP ports for a namespace"
+        description="Add/update TCP port mapping(s) in kustomization.yaml (clean literal style)"
     )
-    parser.add_argument(
-        "namespace",
-        help="Exact namespace name to use (e.g., dremio-prod-3, dremio-cluster-b)"
-    )
-    parser.add_argument(
-        "--file",
-        default="kustomization.yaml",
-        help="Path to kustomization.yaml (default: kustomization.yaml)"
-    )
-    parser.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="Show changes without writing to file"
-    )
+    parser.add_argument("host_port", type=int, help="First host port (e.g. 33107)")
+    parser.add_argument("namespace", help="Namespace (e.g. dremio-prod-3)")
+    parser.add_argument("service", help="Service name (e.g. dremio-client)")
+    parser.add_argument("container_port", type=int, help="Target container port (e.g. 31010)")
+
+    parser.add_argument("--second-host", type=int, help="Second host port (e.g. 34907)")
+    parser.add_argument("--second-container", type=int, help="Second container port (e.g. 32010)")
+
+    parser.add_argument("--file", default="kustomization.yaml", help="Path to file")
+    parser.add_argument("--dry-run", action="store_true", help="Only show result")
 
     args = parser.parse_args()
 
     file_path = Path(args.file)
-    if not file_path.exists():
-        print(f"Error: {file_path} not found", file=sys.stderr)
-        sys.exit(1)
+    if not file_path.is_file():
+        print(f"Error: File not found: {file_path}", file=sys.stderr)
+        return 1
 
-    with open(file_path, 'r') as f:
-        data = yaml.safe_load(f) or {}
+    # Load with ruamel.yaml
+    with open(file_path, encoding='utf-8') as f:
+        data = yaml.load(f) or {}
 
-    updated_data = update_tcp_ports_in_patch(data, args.namespace)
+    second = None
+    if args.second_host is not None and args.second_container is not None:
+        second = (args.second_host, args.second_container)
+
+    updated_data = update_tcp_patch(
+        data,
+        args.host_port,
+        args.namespace,
+        args.service,
+        args.container_port,
+        second
+    )
 
     if args.dry_run:
-        print("\n--- Dry Run: Updated kustomization.yaml ---")
-        yaml.dump(updated_data, sys.stdout, sort_keys=False, indent=2)
+        print("\n--- DRY RUN - would write to file: ---")
+        yaml.dump(updated_data, sys.stdout)
+        print("\n--- end of dry run ---")
     else:
-        with open(file_path, 'w') as f:
-            yaml.dump(updated_data, f, sort_keys=False, indent=2)
-        print(f"Successfully updated {file_path}")
+        # Write back using ruamel.yaml (preserves style)
+        with open(file_path, 'w', encoding='utf-8') as f:
+            yaml.dump(updated_data, f)
+        print(f"File updated: {file_path}")
+
+    return 0
+
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
