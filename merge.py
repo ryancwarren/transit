@@ -1,13 +1,16 @@
 #!/usr/bin/env python3
 """
-Update kustomization.yaml port patches with ruamel.yaml
-- tcp:      merge / append / update existing mappings
-- nodeport: strict - reject if any requested nodePort already exists
+Update kustomization.yaml port patches (TCP or NodePort) with ruamel.yaml
+
+Usage examples:
+  python script.py tcp 311337 dremio-4 dremio-client 31010 --file v1.yaml
+  python script.py tcp 311338 prod-ns app-svc 31010 --second 349338 32010 --dry-run
+  python script.py nodeport 30085 8080 --file v1.yaml
 """
 
 import sys
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict
 
 from ruamel.yaml import YAML
 from ruamel.yaml.scalarstring import LiteralScalarString
@@ -23,71 +26,63 @@ yaml.preserve_quotes = True
 PATCH_CONFIG = {
     "tcp": {
         "path": "/spec/values/tcp",
-        "name": "TCP host port mapping",
-        "merge_behavior": "merge_update",  # append + update if exists
-        "key_arg_name": "host_port",
-        "value_args": ["namespace", "service", "container_port"],
-        "value_pattern": "{namespace}/{service}:{container_port}",
-        "second_flags": ["--second-host", "--second-container"],
+        "name": "TCP host port → namespace/service:containerPort",
+        "merge": "update_append",
+        "value_template": "{ns}/{svc}:{cp}"
     },
     "nodeport": {
         "path": "/spec/values/controller/service/nodePorts/tcp",
-        "name": "NodePort",
-        "merge_behavior": "exclusive",     # reject if any overlap
-        "key_arg_name": "node_port",
-        "value_args": ["container_port"],
-        "value_pattern": "{container_port}",
-        "second_flags": ["--second-node", "--second-container"],
+        "name": "NodePort → containerPort",
+        "merge": "exclusive",
+        "value_template": "{cp}"
     }
 }
 
 
-def find_patch_index(patches: List[dict], target_path: str) -> int:
-    for i, patch_entry in enumerate(patches):
-        if not isinstance(patch_entry, dict) or 'patch' not in patch_entry:
-            continue
-        content = str(patch_entry['patch'])
-        if f'path: {target_path}' in content and '- op: add' in content:
-            return i
+def find_patch_index(patches: list, target_path: str) -> int:
+    for i, item in enumerate(patches):
+        if isinstance(item, dict) and 'patch' in item:
+            content = str(item['patch'])
+            if f'path: {target_path}' in content and '- op: add' in content:
+                return i
     return -1
 
 
-def extract_current_mappings(patch_text: str) -> Dict[str, str]:
+def parse_mappings(patch_content: str) -> Dict[str, str]:
+    """Robust extraction of port mappings from patch"""
     mappings = {}
-    lines = patch_text.splitlines()
-    capturing = False
+    lines = patch_content.splitlines()
+    in_value = False
 
     for line in lines:
         s = line.rstrip()
-        if s.strip() == 'value: |':
-            capturing = True
+        if 'value: |' in s:
+            in_value = True
             continue
-        if capturing and ':' in s and s.lstrip().startswith(('0','1','2','3','4','5','6','7','8','9')):
+
+        if in_value and ':' in s:
+            # Try to get content after indentation
             content = s.lstrip()
-            try:
-                key_part, value_part = content.split(':', 1)
-                key = key_part.strip()
-                value = value_part.strip()
-                if key.isdigit():
-                    mappings[key] = value
-            except ValueError:
-                continue
+            if content and content[0].isdigit():
+                try:
+                    key, value = [x.strip() for x in content.split(':', 1)]
+                    if key.isdigit():
+                        mappings[key] = value
+                except:
+                    pass
     return mappings
 
 
-def build_patch_literal(path: str, mappings: Dict[str, str]) -> LiteralScalarString:
+def build_patch_content(path: str, mappings: Dict[str, str]) -> LiteralScalarString:
     lines = [
         "- op: add",
         f"  path: {path}",
         "  value: |"
     ]
-
-    for port in sorted(mappings.keys(), key=int):
+    for port in sorted(mappings, key=int):
         lines.append(f"    {port}: {mappings[port]}")
-
     if not mappings:
-        lines.append("    {}  # will be replaced")
-
+        lines.append("    {}")
     return LiteralScalarString("\n".join(lines))
 
 
@@ -99,114 +94,105 @@ def main():
         formatter_class=argparse.RawTextHelpFormatter
     )
 
-    parser.add_argument("type", choices=list(PATCH_CONFIG.keys()),
-                        help="patch type to modify")
-
-    parser.add_argument("main_port", type=int,
-                        help="primary port number")
-
     parser.add_argument("--file", default="kustomization.yaml",
-                        help="target kustomization.yaml file")
-
+                        help="Path to kustomization.yaml")
     parser.add_argument("--dry-run", action="store_true",
-                        help="show result without writing")
+                        help="Show result without writing file")
 
-    parser.add_argument("--second", nargs=2, type=int, metavar=("PORT", "TARGET_PORT"),
-                        help="optional second mapping (port targetPort)")
+    subparsers = parser.add_subparsers(dest="command", required=True)
 
-    args, unknown = parser.parse_known_args()
+    # TCP subcommand
+    tcp = subparsers.add_parser("tcp", help="Update TCP host port mappings")
+    tcp.add_argument("host_port", type=int, help="Host port (e.g. 33100, 311337)")
+    tcp.add_argument("namespace", help="Namespace (e.g. dremio-prod-3)")
+    tcp.add_argument("service", help="Service name (e.g. dremio-client)")
+    tcp.add_argument("container_port", type=int, help="Container port (e.g. 31010)")
+    tcp.add_argument("--second", nargs=2, type=int, metavar=("HOST", "CONTAINER"),
+                     help="Optional second pair: host_port container_port")
 
-    cfg = PATCH_CONFIG[args.type]
+    # NodePort subcommand
+    np = subparsers.add_parser("nodeport", help="Update NodePort mappings")
+    np.add_argument("node_port", type=int, help="Node port (e.g. 30085)")
+    np.add_argument("container_port", type=int, help="Container port (e.g. 8080)")
+    np.add_argument("--second", nargs=2, type=int, metavar=("NODE", "CONTAINER"),
+                    help="Optional second pair: node_port container_port")
 
-    # Add required positional arguments according to patch type
-    for arg_name in cfg["value_args"]:
-        if arg_name == "container_port":
-            parser.add_argument(arg_name, type=int, required=True)
-        else:
-            parser.add_argument(arg_name, required=True)
-
-    # Re-parse with full arguments
     args = parser.parse_args()
 
-    value_args_values = [getattr(args, name) for name in cfg["value_args"]]
+    cfg = PATCH_CONFIG[args.command]
 
     file_path = Path(args.file)
     if not file_path.is_file():
         print(f"Error: File not found: {file_path}", file=sys.stderr)
-        sys.exit(1)
+        return 1
 
     data = yaml.load(file_path) or {}
 
-    # Prepare new mappings
+    # Prepare new mapping(s)
     new_mappings = {}
-    main_key = str(args.main_port)
 
-    if args.type == "tcp":
-        ns, svc, cp = value_args_values
-        new_mappings[main_key] = f"{ns}/{svc}:{cp}"
-    else:
-        cp = value_args_values[0]
-        new_mappings[main_key] = str(cp)
+    if args.command == "tcp":
+        main_value = cfg["value_template"].format(
+            ns=args.namespace, svc=args.service, cp=args.container_port)
+        new_mappings[str(args.host_port)] = main_value
 
-    if args.second:
-        sec_port, sec_target = args.second
-        sec_key = str(sec_port)
-        if args.type == "tcp":
-            new_mappings[sec_key] = f"{ns}/{svc}:{sec_target}"
-        else:
-            new_mappings[sec_key] = str(sec_target)
+        if args.second:
+            s_host, s_container = args.second
+            new_mappings[str(s_host)] = cfg["value_template"].format(
+                ns=args.namespace, svc=args.service, cp=s_container)
+    else:  # nodeport
+        new_mappings[str(args.node_port)] = str(args.container_port)
+        if args.second:
+            s_node, s_container = args.second
+            new_mappings[str(s_node)] = str(s_container)
 
     # Find existing patch
     patches = data.setdefault('patches', [])
-    patch_idx = find_patch_index(patches, cfg["path"])
+    idx = find_patch_index(patches, cfg["path"])
 
     current = {}
-    if patch_idx >= 0:
-        current = extract_current_mappings(str(patches[patch_idx]['patch']))
+    if idx >= 0:
+        current = parse_mappings(str(patches[idx]['patch']))
 
-    # Apply merge strategy
-    if cfg["merge_behavior"] == "exclusive":
+    # Merge strategy
+    if cfg["merge"] == "exclusive":
         overlap = set(new_mappings.keys()) & set(current.keys())
         if overlap:
-            print("Error: Cannot add nodePort(s) - the following already exist:", file=sys.stderr)
-            for p in sorted(overlap, key=int):
-                print(f"  • {p} → {current[p]}", file=sys.stderr)
-            sys.exit(2)
+            print("Error: The following ports already exist:", file=sys.stderr)
+            for p in sorted(overlap):
+                print(f"  {p} → {current[p]}", file=sys.stderr)
+            return 2
 
-    # For tcp → merge (append + update)
     current.update(new_mappings)
 
     # Build new patch
-    new_literal = build_patch_literal(cfg["path"], current)
+    new_content = build_patch_content(cfg["path"], current)
+    new_patch = {'patch': new_content}
 
-    new_patch_entry = {'patch': new_literal}
-
-    if patch_idx >= 0:
-        patches[patch_idx] = new_patch_entry
+    if idx >= 0:
+        patches[idx] = new_patch
         action = "Updated (merged)"
     else:
-        patches.append(new_patch_entry)
+        patches.append(new_patch)
         action = "Created"
 
-    print(f"{action} {cfg['name']} patch")
-    print(f"  Added/updated port(s): {args.main_port}", end="")
+    print(f"{action} {cfg['name']}")
+    print(f"  Added/updated: {args.host_port if args.command == 'tcp' else args.node_port}", end="")
     if args.second:
         print(f" + {args.second[0]}", end="")
     print()
 
     if args.dry_run:
-        print("\nResult (dry-run):")
+        print("\nDry run result:")
         print("─" * 70)
         yaml.dump(data, sys.stdout)
         print("─" * 70)
     else:
-        try:
-            yaml.dump(data, file_path)
-            print(f"File updated successfully: {file_path}")
-        except Exception as e:
-            print(f"Failed to write file: {e}", file=sys.stderr)
-            sys.exit(1)
+        yaml.dump(data, file_path)
+        print(f"File updated: {file_path}")
+
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
