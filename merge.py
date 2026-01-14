@@ -49,23 +49,37 @@ def find_patch_index(patches: list, target_path: str) -> int:
 
 
 def parse_mappings(patch_content: str) -> Dict[str, str]:
-    """Robust extraction of port mappings from patch"""
+    """Robust extraction of port mappings from patch (literal, flow, comments, varying indent)"""
     mappings = {}
     lines = patch_content.splitlines()
     in_value = False
+    flow_value = None
 
     for line in lines:
         s = line.rstrip()
         if 'value: |' in s:
             in_value = True
             continue
+        if 'value:' in s and '{' in s and not in_value:
+            # Flow style
+            value_part = s.split('value:', 1)[1].strip()
+            if value_part.startswith('{') and value_part.endswith('}'):
+                flow_value = value_part[1:-1].strip()
+                # Parse flow entries
+                entries = flow_value.split(',')
+                for entry in entries:
+                    if ':' in entry:
+                        key, value = [x.strip() for x in entry.split(':', 1)]
+                        if key.isdigit():
+                            mappings[key] = value.strip('"\'')  # In case quoted
+            continue
 
         if in_value and ':' in s:
-            # Try to get content after indentation
             content = s.lstrip()
             if content and content[0].isdigit():
                 try:
                     key, value = [x.strip() for x in content.split(':', 1)]
+                    value = value.split('#')[0].strip()  # Ignore inline comments
                     if key.isdigit():
                         mappings[key] = value
                 except:
@@ -177,7 +191,7 @@ def main():
         action = "Created"
 
     print(f"{action} {cfg['name']}")
-    print(f"  Added/updated: {args.host_port if args.command == 'tcp' else args.node_port}", end="")
+    print(f"  Added/updated port(s): {args.host_port if args.command == 'tcp' else args.node_port}", end="")
     if args.second:
         print(f" + {args.second[0]}", end="")
     print()
