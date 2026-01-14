@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 """
-Flexible kustomization.yaml TCP/NodePort patch updater using ruamel.yaml
-Supports different patch paths and mapping styles.
+Update different kinds of port patches in kustomization.yaml
+Supports multiple patch types with clean literal block style (using ruamel.yaml)
 """
 
 import sys
-import argparse
 from pathlib import Path
 from typing import Dict, Optional, Tuple
 
@@ -16,201 +15,201 @@ yaml = YAML()
 yaml.indent(mapping=2, sequence=4, offset=2)
 yaml.width = 4096
 yaml.preserve_quotes = True
+yaml.allow_duplicate_keys = False
 
 
-# ── Configuration of supported patch types ──────────────────────────────────────
+# ── Supported patch types configuration ─────────────────────────────────────────
 
 PATCH_TYPES = {
     "tcp": {
         "path": "/spec/values/tcp",
-        "format": lambda k, v: f"{k}: {v}",                    # hostPort: ns/svc:port
-        "key_name": "host_port",
-        "value_factory": lambda ns, svc, cp: f"{ns}/{svc}:{cp}",
-        "arg_names": ["namespace", "service", "container_port"],
-        "second_arg_names": ["second-host", "second-container"],
+        "description": "Host port → namespace/service:containerPort",
+        "key_arg": "host_port",
+        "value_args": ["namespace", "service", "container_port"],
+        "value_fmt": "{ns}/{svc}:{cp}",
+        "second_args": ["--second-host", "--second-container"],
     },
     "nodeport": {
         "path": "/spec/values/controller/service/nodePorts/tcp",
-        "format": lambda k, v: f"{k}: {v}",                    # nodePort: containerPort
-        "key_name": "node_port",
-        "value_factory": lambda *args: str(args[2]),           # just container port
-        "arg_names": ["container_port"],
-        "second_arg_names": ["second-node", "second-container"],
-        "value_is_int": True,
+        "description": "NodePort → containerPort",
+        "key_arg": "node_port",
+        "value_args": ["container_port"],
+        "value_fmt": "{cp}",
+        "second_args": ["--second-node", "--second-container"],
     }
 }
 
 
-def parse_existing_mappings(patch_content: str, target_path: str) -> Dict[str, str]:
-    """Extract current key:value mappings from patch text"""
-    current = {}
-    lines = patch_content.splitlines()
-    in_value_block = False
+def find_patch_index(patches: list, target_path: str) -> int:
+    """Find index of existing patch with given path"""
+    for i, item in enumerate(patches):
+        if not isinstance(item, dict) or 'patch' not in item:
+            continue
+        content = str(item['patch'])
+        if f'path: {target_path}' in content and '- op: add' in content:
+            return i
+    return -1
+
+
+def parse_port_mappings(patch_text: str) -> Dict[str, str]:
+    """Extract port mappings from literal block"""
+    mappings = {}
+    lines = patch_text.splitlines()
+    in_value = False
 
     for line in lines:
-        stripped = line.rstrip()
-        if stripped.strip() == 'value: |':
-            in_value_block = True
+        s = line.rstrip()
+        if s.strip() == 'value: |':
+            in_value = True
             continue
-        if in_value_block and ':' in stripped and stripped.lstrip().startswith(('0','1','2','3','4','5','6','7','8','9')):
+        if in_value and ':' in s and s.lstrip().startswith(('0','1','2','3','4','5','6','7','8','9')):
+            # Remove leading indentation, split on first colon
+            content = s.lstrip()
             try:
-                _, rest = line.split(':', 1)
-                key, value = rest.split(':', 1) if ':' in rest else (rest.strip(), '')
+                key, value = content.split(':', 1)
                 key = key.strip()
                 value = value.strip()
                 if key.isdigit():
-                    current[key] = value
-            except:
-                pass
-    return current
+                    mappings[key] = value
+            except ValueError:
+                continue
+    return mappings
 
 
-def build_patch_text(path: str, mappings: Dict[str, str]) -> str:
+def build_patch_content(path: str, mappings: Dict[str, str]) -> LiteralScalarString:
+    """Create clean literal block patch content"""
     lines = [
         "- op: add",
         f"  path: {path}",
         "  value: |"
     ]
 
-    for k in sorted(mappings.keys(), key=int):
-        lines.append(f"    {k}: {mappings[k]}")
+    for port in sorted(mappings, key=int):
+        lines.append(f"    {port}: {mappings[port]}")
 
     if not mappings:
-        lines.append("    {}")
+        lines.append("    {}  # empty - will be replaced")
 
-    return "\n".join(lines)
-
-
-def update_patch(
-    data: dict,
-    patch_type: str,
-    main_key: int,
-    main_args: list,
-    second_pair: Optional[Tuple[int, int]] = None
-) -> dict:
-    cfg = PATCH_TYPES[patch_type]
-    target_path = cfg["path"]
-
-    # Prepare new mapping(s)
-    value_factory = cfg["value_factory"]
-    new_mappings = {}
-
-    if patch_type == "tcp":
-        ns, svc, cp = main_args
-        new_mappings[str(main_key)] = value_factory(ns, svc, cp)
-    else:  # nodeport
-        cp = main_args[0]
-        new_mappings[str(main_key)] = value_factory(None, None, cp)
-
-    if second_pair:
-        k2, v2 = second_pair
-        if patch_type == "tcp":
-            new_mappings[str(k2)] = value_factory(ns, svc, v2)
-        else:
-            new_mappings[str(k2)] = value_factory(None, None, v2)
-
-    # Find existing patch
-    patch_index = -1
-    existing_patch = None
-    patches = data.get('patches', [])
-
-    for i, item in enumerate(patches):
-        if isinstance(item, dict) and 'patch' in item:
-            content = str(item['patch'])
-            if f'path: {target_path}' in content and '- op: add' in content:
-                patch_index = i
-                existing_patch = item
-                break
-
-    # Get current mappings
-    current_mappings = {}
-    if existing_patch:
-        current_mappings = parse_existing_mappings(str(existing_patch['patch']), target_path)
-
-    # Merge (new overrides old)
-    current_mappings.update(new_mappings)
-
-    # Build and wrap new patch
-    patch_text = build_patch_text(target_path, current_mappings)
-    new_patch_entry = {'patch': LiteralScalarString(patch_text)}
-
-    if patch_index >= 0:
-        data['patches'][patch_index] = new_patch_entry
-        print(f"Updated existing {patch_type} patch → added/updated {main_key}")
-        if second_pair:
-            print(f"                           + {second_pair[0]}")
-    else:
-        if 'patches' not in data:
-            data['patches'] = []
-        data['patches'].append(new_patch_entry)
-        print(f"Created new {patch_type} patch → added {main_key}")
-        if second_pair:
-            print(f"                    + {second_pair[0]}")
-
-    return data
+    return LiteralScalarString("\n".join(lines))
 
 
 def main():
+    import argparse
+
     parser = argparse.ArgumentParser(
-        description="Update different types of port patches in kustomization.yaml",
+        description="Add/update port mappings in kustomization.yaml patches",
         formatter_class=argparse.RawTextHelpFormatter
     )
 
-    parser.add_argument("patch_type", choices=list(PATCH_TYPES.keys()),
-                        help="Type of patch to update\n  tcp       → /spec/values/tcp\n  nodeport  → /spec/values/controller/service/nodePorts/tcp")
+    parser.add_argument("type", choices=sorted(PATCH_TYPES.keys()),
+                        help="Patch type to modify")
+
+    parser.add_argument("main_key", type=int,
+                        help="Primary port number (host_port / node_port)")
 
     parser.add_argument("--file", default="kustomization.yaml",
-                        help="Path to kustomization.yaml")
+                        help="kustomization.yaml file to modify")
 
-    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="Only show what would be written")
 
-    # Common positional args will be checked based on type
-    parser.add_argument("main_key", type=int, help="Primary port (host_port or node_port)")
-    parser.add_argument("extra_args", nargs="*", help="Additional arguments depending on patch_type")
-
-    # Second pair (optional for both types)
-    parser.add_argument("--second", type=int, nargs=2, metavar=("KEY", "PORT"),
-                        help="Second pair: key containerPort (for both types)")
+    # Will be populated dynamically based on type
+    # Second pair is always optional
+    parser.add_argument("--second", nargs=2, type=int, metavar=("KEY", "PORT"),
+                        help="Optional second port pair")
 
     args = parser.parse_args()
 
-    cfg = PATCH_TYPES[args.patch_type]
-    expected_count = len(cfg["arg_names"])
+    cfg = PATCH_TYPES[args.type]
 
-    if len(args.extra_args) != expected_count:
-        parser.error(
-            f"For patch_type '{args.patch_type}' expected {expected_count} extra arguments "
-            f"({', '.join(cfg['arg_names'])}), got {len(args.extra_args)}"
-        )
+    # Build dynamic parser for value arguments
+    value_group = parser.add_argument_group(f"{args.type.upper()} required arguments")
+    for arg_name in cfg["value_args"]:
+        if arg_name == "container_port":
+            value_group.add_argument(arg_name, type=int)
+        else:
+            value_group.add_argument(arg_name)
+
+    # Re-parse with the full set of arguments
+    args = parser.parse_args()
+
+    # Get value arguments in order
+    value_values = [getattr(args, name) for name in cfg["value_args"]]
 
     file_path = Path(args.file)
     if not file_path.is_file():
         print(f"Error: File not found: {file_path}", file=sys.stderr)
         return 1
 
-    with open(file_path, encoding='utf-8') as f:
-        data = yaml.load(f) or {}
+    # Load preserving style/comments
+    try:
+        with open(file_path, encoding='utf-8') as f:
+            data = yaml.load(f) or {}
+    except Exception as e:
+        print(f"Error loading YAML: {e}", file=sys.stderr)
+        return 1
 
-    second_pair = None
+    # Prepare new mapping(s)
+    new_mappings = {}
+    key_str = str(args.main_key)
+
+    if args.type == "tcp":
+        ns, svc, cp = value_values
+        new_mappings[key_str] = f"{ns}/{svc}:{cp}"
+    else:  # nodeport
+        cp, = value_values
+        new_mappings[key_str] = str(cp)
+
     if args.second:
-        second_pair = tuple(args.second)
+        s_key, s_port = args.second
+        s_key_str = str(s_key)
+        if args.type == "tcp":
+            new_mappings[s_key_str] = f"{ns}/{svc}:{s_port}"
+        else:
+            new_mappings[s_key_str] = str(s_port)
 
-    updated = update_patch(
-        data,
-        args.patch_type,
-        args.main_key,
-        args.extra_args,
-        second_pair
-    )
+    # Find or prepare patch
+    patches = data.setdefault('patches', [])
+    idx = find_patch_index(patches, cfg["path"])
 
-    if args.dry_run:
-        print("\n--- DRY RUN --------------------------------")
-        yaml.dump(updated, sys.stdout)
-        print("--------------------------------------------\n")
+    current_mappings = {}
+    if idx >= 0:
+        current_mappings = parse_port_mappings(str(patches[idx]['patch']))
+
+    # Apply update
+    current_mappings.update(new_mappings)
+
+    # Build new patch
+    new_content = build_patch_content(cfg["path"], current_mappings)
+
+    new_patch = {'patch': new_content}
+
+    if idx >= 0:
+        patches[idx] = new_patch
+        action = "Updated"
     else:
-        with open(file_path, 'w', encoding='utf-8') as f:
-            yaml.dump(updated, f)
-        print(f"Updated: {file_path}")
+        patches.append(new_patch)
+        action = "Created"
+
+    print(f"{action} {args.type} patch with port(s): {args.main_key}", end="")
+    if args.second:
+        print(f" + {args.second[0]}", end="")
+    print()
+
+    # Output / save
+    if args.dry_run:
+        print("\nWould write the following to", file_path)
+        print("-" * 50)
+        yaml.dump(data, sys.stdout)
+        print("-" * 50)
+    else:
+        try:
+            with open(file_path, 'w', encoding='utf-8') as f:
+                yaml.dump(data, f)
+            print(f"Successfully written to: {file_path}")
+        except Exception as e:
+            print(f"Error writing file: {e}", file=sys.stderr)
+            return 1
 
     return 0
 
