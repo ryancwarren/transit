@@ -1,10 +1,28 @@
-name: Manage Kustomize TCP/NodePort Ports
+name: Update Kustomize Ports → Create PR
 
 on:
   workflow_dispatch:
     inputs:
+      upstream_repo:
+        description: 'Upstream repository (owner/repo format)'
+        required: true
+        type: string
+        # example: company/dremio-platform
+
+      branch_name:
+        description: 'Name of the new branch to create'
+        required: true
+        type: string
+        default: update-tcp-ports-${{ github.run_id }}
+
+      kustomization_path:
+        description: 'Path to kustomization.yaml file (relative to repo root)'
+        required: true
+        type: string
+        default: kustomization.yaml
+
       patch_type:
-        description: 'Type of patch to update (tcp or nodeport)'
+        description: 'tcp or nodeport'
         required: true
         type: choice
         options:
@@ -12,7 +30,7 @@ on:
           - nodeport
 
       main_port:
-        description: 'Main port number (host_port or node_port)'
+        description: 'Main port (host_port / node_port)'
         required: true
         type: string
 
@@ -32,7 +50,7 @@ on:
         type: string
 
       second_port:
-        description: 'Second host/node port (optional)'
+        description: 'Second port (optional)'
         required: false
         type: string
 
@@ -41,95 +59,115 @@ on:
         required: false
         type: string
 
-      file:
-        description: 'Path to kustomization.yaml file (relative to repo root)'
+      pr_title:
+        description: 'Title of the created Pull Request'
         required: false
-        default: 'kustomization.yaml'
+        default: 'chore(ports): update ${{ inputs.patch_type }} ports (${{ inputs.main_port }})'
         type: string
 
-      dry_run:
-        description: 'Run in dry-run mode (only show changes, don't commit)'
+      pr_body:
+        description: 'Body of the PR (markdown)'
         required: false
-        type: boolean
-        default: true
+        default: |
+          Automated update of TCP/NodePort mappings using port-management script.
+
+          **Changes:**
+          - ${{ inputs.patch_type }}: added/updated port ${{ inputs.main_port }}
+          - File: ${{ inputs.kustomization_path }}
+        type: string
+
+permissions:
+  contents: write
+  pull-requests: write
 
 jobs:
-  update-ports:
+  update-and-pr:
     runs-on: ubuntu-24.04
-
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - name: Show inputs (debug)
+        run: |
+          echo "Upstream repo: ${{ inputs.upstream_repo }}"
+          echo "Branch:       ${{ inputs.branch_name }}"
+          echo "File:         ${{ inputs.kustomization_path }}"
+          echo "Type:         ${{ inputs.patch_type }}"
+          echo "Main port:    ${{ inputs.main_port }}"
 
-      - name: Set up Python 3.11
+      - name: Checkout fork (or create fork if needed)
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository }}
+          ref: main
+          path: fork
+
+      # ── Fork the upstream repo if we're not already in a fork ────────────────
+      - name: Check if we need to fork upstream
+        id: check_fork
+        run: |
+          UPSTREAM_OWNER=$(echo "${{ inputs.upstream_repo }}" | cut -d'/' -f1)
+          UPSTREAM_REPO=$(echo "${{ inputs.upstream_repo }}" | cut -d'/' -f2)
+
+          gh repo fork "$UPSTREAM_OWNER/$UPSTREAM_REPO" --remote=false --org "${{ github.repository_owner }}" || true
+          echo "forked_repo=$UPSTREAM_OWNER-${UPSTREAM_REPO}-fork" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout forked repository
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ steps.check_fork.outputs.forked_repo || github.repository }}
+          path: workspace
+          ref: main
+
+      - name: Create and checkout new branch
+        working-directory: workspace
+        run: |
+          git checkout -b "${{ inputs.branch_name }}"
+
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
           cache: 'pip'
 
       - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install ruamel.yaml
-
-      - name: Prepare script
-        run: |
-          # If your script is already in the repository, you can skip this step
-          # For demo purposes - you can remove this and just use your existing file
-          cat > manage-ports.py << 'EOF'
-          # Paste your complete python script here
-          # .......................................
-          # (the full script from previous messages)
-          # .......................................
-          EOF
+        run: pip install ruamel.yaml
 
       - name: Run port management script
+        working-directory: workspace
         env:
-          # Optional: if your script needs any environment variables
+          SCRIPT_PATH: manage-ports.py
         run: |
-          args=()
+          # If script is not already in repo, create it here (or assume it's present)
+          # In real workflow you'd probably commit the script to your fork/repo
 
-          args+=("${{ inputs.patch_type }}")
-          args+=("${{ inputs.main_port }}")
+          python "${SCRIPT_PATH}" \
+            "${{ inputs.patch_type }}" \
+            "${{ inputs.main_port }}" \
+            ${{ inputs.patch_type == 'tcp' && format('"{0}" "{1}" {2}', inputs.namespace, inputs.service, inputs.container_port) || inputs.container_port }} \
+            ${{ inputs.second_port && format('--second {0} {1}', inputs.second_port, inputs.second_container) || '' }} \
+            --file "${{ inputs.kustomization_path }}" \
+            --dry-run false
 
-          if [ "${{ inputs.patch_type }}" = "tcp" ]; then
-            args+=("${{ inputs.namespace }}")
-            args+=("${{ inputs.service }}")
-            args+=("${{ inputs.container_port }}")
-          else
-            args+=("${{ inputs.container_port }}")
-          fi
-
-          if [ -n "${{ inputs.second_port }}" ] && [ -n "${{ inputs.second_container }}" ]; then
-            args+=(--second "${{ inputs.second_port }}" "${{ inputs.second_container }}")
-          fi
-
-          if [ "${{ inputs.dry_run }}" = "true" ]; then
-            args+=(--dry-run)
-          fi
-
-          if [ -n "${{ inputs.file }}" ] && [ "${{ inputs.file }}" != "kustomization.yaml" ]; then
-            args+=(--file "${{ inputs.file }}")
-          fi
-
-          python manage-ports.py "${args[@]}"
-
-      # ── Only commit & push if not dry-run ─────────────────────────────────────
-      - name: Commit changes (if not dry-run)
-        if: ${{ !inputs.dry_run }}
+      - name: Commit and push changes
+        working-directory: workspace
         run: |
-          git config --global user.name "GitHub Actions"
-          git config --global user.email "actions@github.com"
-          
-          git add ${{ inputs.file }}
-          git diff --staged --quiet || git commit -m "chore(ports): update ${inputs.patch_type} ports (${inputs.main_port})"
-          git push
+          git config user.name "GitHub Actions"
+          git config user.email "actions@github.com"
 
-      - name: Show result message
-        run: |
-          echo ""
-          if [ "${{ inputs.dry_run }}" = "true" ]; then
-            echo "Dry run completed - no changes were committed."
-          else
-            echo "Changes committed and pushed successfully."
-          fi
+          git add "${{ inputs.kustomization_path }}"
+          git commit -m "${{ inputs.pr_title }}" || echo "No changes to commit"
+          git push origin HEAD
+
+      - name: Create Pull Request
+        uses: peter-evans/create-pull-request@v7
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          commit-message: "${{ inputs.pr_title }}"
+          title: "${{ inputs.pr_title }}"
+          body: "${{ inputs.pr_body }}"
+          base: main
+          branch: "${{ inputs.branch_name }}"
+          delete-branch: true
+          labels: |
+            automerge
+            ports-update
+          reviewers: |
+            ${{ github.actor }}
